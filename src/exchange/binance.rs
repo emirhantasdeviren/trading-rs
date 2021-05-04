@@ -1,6 +1,10 @@
 use std::fmt;
+use std::io::Read;
 
-use chrono::{DateTime, TimeZone, Utc};
+use super::Interval;
+use crate::finder::Haystack;
+
+use chrono::Utc;
 use hmac::{Hmac, Mac, NewMac};
 use reqwest::blocking::{Client, Response};
 use sha2::Sha256;
@@ -31,7 +35,7 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {}
 
 impl Error {
-    pub fn from_json(slice: &[u8]) -> Self {
+    fn from_json(slice: &[u8]) -> Self {
         let mut code = 0;
         let mut message = String::new();
 
@@ -85,12 +89,27 @@ impl Error {
 }
 
 #[derive(Debug)]
-pub struct Symbol {
+pub struct Asset {
+    pub name: String,
+    pub balance: f64,
+}
+
+impl Asset {
+    pub fn new(name: &str, balance: f64) -> Self {
+        Self {
+            name: name.to_string(),
+            balance,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct SymbolString {
     inner: String,
     mid: usize,
 }
 
-impl Symbol {
+impl SymbolString {
     pub fn new(base: &str, quote: &str) -> Self {
         let mut inner = String::with_capacity(base.len() + quote.len());
         inner.push_str(base);
@@ -100,6 +119,10 @@ impl Symbol {
             inner,
             mid: base.len(),
         }
+    }
+
+    pub fn from_raw_parts(inner: String, mid: usize) -> Self {
+        Self { inner, mid }
     }
 
     pub fn base(&self) -> &str {
@@ -115,19 +138,19 @@ impl Symbol {
     }
 }
 
-impl fmt::Display for Symbol {
+impl fmt::Display for SymbolString {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", &self.inner)
     }
 }
 
-impl PartialEq for Symbol {
+impl PartialEq for SymbolString {
     fn eq(&self, other: &Self) -> bool {
         self.inner == other.inner
     }
 }
 
-impl Eq for Symbol {}
+impl Eq for SymbolString {}
 
 pub struct Account {
     _api_key: String,
@@ -163,7 +186,7 @@ impl Account {
 
     pub fn get_kline_data(
         &self,
-        symbol: &Symbol,
+        symbol: &str,
         interval: Interval,
         start_time: Option<i64>,
         end_time: Option<i64>,
@@ -199,18 +222,115 @@ impl Account {
         }
     }
 
-    fn signed_endpoint(&self, parameters: &str) -> String {
-        let mut mac: Hmac<Sha256> = Hmac::new_varkey(self.secret_key.as_bytes()).unwrap();
-        mac.update(parameters.as_bytes());
-        format!("{:x}", mac.finalize().into_bytes())
+    pub fn market_buy(&self, symbol: &str, quote_order_quantity: f64) -> Result<Response> {
+        let parameters = format!(
+            "symbol={}&side=BUY&type=MARKET&quoteOrderQty={}&timestamp={}",
+            symbol,
+            quote_order_quantity,
+            Utc::now().timestamp_millis(),
+        );
+
+        self.new_order(parameters)
     }
 
-    pub fn new_order(&self, parameters: String) -> Result<Response> {
+    pub fn market_sell(&self, symbol: &str, quantity: f64) -> Result<Response> {
+        let parameters = format!(
+            "symbol={}&side=SELL&type=MARKET&quantity={}&timestamp={}",
+            symbol,
+            quantity,
+            Utc::now().timestamp_millis(),
+        );
+
+        self.new_order(parameters)
+    }
+
+    pub fn get_balance(&self, asset: &str) -> Result<f64> {
+        let response = self.account_information()?;
+        let bytes = response.bytes().unwrap();
+
+        let mut haystack = Haystack::new(&bytes);
+        let mut balance = String::new();
+
+        haystack.find_key("balances");
+
+        haystack.find_pair("asset", asset);
+        haystack.find_key("free");
+
+        while let Some(b) = haystack.peek() {
+            if **b == b'"' {
+                haystack.next().unwrap();
+                break;
+            }
+
+            haystack.next().unwrap();
+        }
+
+        while let Some(b) = haystack.peek() {
+            if b.is_ascii_digit() || **b == b'.' {
+                balance.push(char::from(**b));
+            }
+
+            if **b == b'"' {
+                break;
+            }
+
+            haystack.next().unwrap();
+        }
+
+        Ok(balance.parse().unwrap())
+    }
+
+    pub fn get_precision(&self, symbol: &str) -> usize {
+        let mut f =
+            std::fs::File::open("exchangeInfo.json").expect("Could not open exchangeInfo.json");
+        let mut buffer = Vec::new();
+        f.read_to_end(&mut buffer).unwrap();
+
+        let mut haystack = Haystack::new(&buffer);
+        let mut precision: Option<usize> = None;
+
+        haystack.find_key("symbols");
+
+        haystack.find_pair("symbol", symbol);
+        haystack.find_key("filters");
+
+        haystack.find_pair("filterType", "LOT_SIZE");
+        haystack.find_key("stepSize");
+
+        while let Some(b) = haystack.peek() {
+            if let Some(ref mut p) = precision {
+                *p += 1;
+                if **b == b'1' {
+                    break;
+                }
+            } else {
+                if **b == b'1' {
+                    precision = Some(0);
+                    break;
+                }
+
+                if **b == b'.' {
+                    precision = Some(0);
+                }
+
+                if **b == b',' {
+                    break;
+                }
+            }
+
+            haystack.next().unwrap();
+        }
+
+        precision.expect("Could not find precision of given symbol")
+    }
+
+    fn new_order(&self, parameters: String) -> Result<Response> {
         let signature = self.signed_endpoint(&parameters);
         let url = format!(
             "{}/api/v3/order?{}&signature={}",
             API_URL, parameters, signature,
         );
+
         let response = self.client.post(&url).send().unwrap();
         let status = response.status();
 
@@ -236,6 +356,12 @@ impl Account {
         } else {
             Err(Error::from_json(&response.bytes().unwrap()))
         }
+    }
+
+    fn signed_endpoint(&self, parameters: &str) -> String {
+        let mut mac: Hmac<Sha256> = Hmac::new_varkey(self.secret_key.as_bytes()).unwrap();
+        mac.update(parameters.as_bytes());
+        format!("{:x}", mac.finalize().into_bytes())
     }
 
     pub fn account_information(&self) -> Result<Response> {
@@ -266,248 +392,6 @@ impl Account {
         } else {
             Err(Error::from_json(&response.bytes().unwrap()))
         }
-    }
-}
-
-#[derive(Clone, Copy)]
-pub enum Interval {
-    Minute(i32),
-    Hour(i32),
-    Day(i32),
-    Week,
-    Month,
-}
-
-impl fmt::Display for Interval {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Interval::Minute(t) => write!(f, "{}m", t),
-            Interval::Hour(t) => write!(f, "{}h", t),
-            Interval::Day(t) => write!(f, "{}d", t),
-            Interval::Week => write!(f, "1w"),
-            Interval::Month => write!(f, "1M"),
-        }
-    }
-}
-
-impl Interval {
-    pub fn to_millis(&self) -> i64 {
-        match self {
-            Interval::Minute(m) => i64::from(*m) * 60 * 1000,
-            Interval::Hour(h) => i64::from(*h) * 60 * 60 * 1000,
-            Interval::Day(d) => i64::from(*d) * 24 * 60 * 60 * 1000,
-            Interval::Week => 7 * 24 * 60 * 60 * 1000,
-            Interval::Month => 30 * 60 * 60 * 1000,
-        }
-    }
-}
-
-pub struct Klines {
-    pub open_time: Vec<DateTime<Utc>>,
-    pub open: Vec<f64>,
-    pub high: Vec<f64>,
-    pub low: Vec<f64>,
-    pub close: Vec<f64>,
-    _volume: Vec<f64>,
-    _close_time: Vec<DateTime<Utc>>,
-    _quote_asset_volume: Vec<f64>,
-    _number_of_trades: Vec<u32>,
-    _tbbav: Vec<f64>,
-    _tbqav: Vec<f64>,
-}
-
-impl Klines {
-    pub fn last(&self) -> Kline {
-        Kline {
-            open: self.open.last().unwrap().clone(),
-            high: self.high.last().unwrap().clone(),
-            low: self.low.last().unwrap().clone(),
-            close: self.close.last().unwrap().clone(),
-            open_time: self.open_time.last().unwrap().clone(),
-        }
-    }
-}
-
-pub fn parse_kline_body(bytes: &[u8], data_count: usize) -> Klines {
-    let mut found_open_bracket = false;
-    let mut found_body = false;
-    let mut index = 0;
-
-    let mut tmp_bytes: Vec<u8> = Vec::new();
-
-    let mut open_time: Vec<DateTime<Utc>> = Vec::with_capacity(data_count);
-    let mut open: Vec<f64> = Vec::with_capacity(data_count);
-    let mut high: Vec<f64> = Vec::with_capacity(data_count);
-    let mut low: Vec<f64> = Vec::with_capacity(data_count);
-    let mut close: Vec<f64> = Vec::with_capacity(data_count);
-    let mut volume: Vec<f64> = Vec::with_capacity(data_count);
-    let mut close_time: Vec<DateTime<Utc>> = Vec::with_capacity(data_count);
-    let mut quote_asset_volume: Vec<f64> = Vec::with_capacity(data_count);
-    let mut number_of_trades: Vec<u32> = Vec::with_capacity(data_count);
-    let mut tbbav: Vec<f64> = Vec::with_capacity(data_count);
-    let mut tbqav: Vec<f64> = Vec::with_capacity(data_count);
-
-    for &byte in bytes {
-        if byte == b'[' {
-            found_open_bracket = true;
-        } else if byte == b']' && found_body {
-            found_open_bracket = false;
-            found_body = false;
-            index = 0;
-            // tmp_bytes.clear();
-        }
-
-        if !found_body && found_open_bracket && byte.is_ascii_digit() {
-            found_body = true;
-        }
-
-        if found_body {
-            if (byte.is_ascii_digit() || byte == b'.') && index <= 10 {
-                tmp_bytes.push(byte);
-            } else if byte == b',' {
-                let tmp_str = std::str::from_utf8(&tmp_bytes).unwrap();
-                match index {
-                    0 => {
-                        let val: i64 = tmp_str.parse().unwrap();
-                        open_time.push(Utc.timestamp_millis(val));
-                    }
-                    1 => {
-                        let val: f64 = tmp_str.parse().unwrap();
-                        open.push(val);
-                    }
-                    2 => {
-                        let val: f64 = tmp_str.parse().unwrap();
-                        high.push(val);
-                    }
-                    3 => {
-                        let val: f64 = tmp_str.parse().unwrap();
-                        low.push(val);
-                    }
-                    4 => {
-                        let val: f64 = tmp_str.parse().unwrap();
-                        close.push(val);
-                    }
-                    5 => {
-                        let val: f64 = tmp_str.parse().unwrap();
-                        volume.push(val);
-                    }
-                    6 => {
-                        let val: i64 = tmp_str.parse().unwrap();
-                        close_time.push(Utc.timestamp_millis(val));
-                    }
-                    7 => {
-                        let val: f64 = tmp_str.parse().unwrap();
-                        quote_asset_volume.push(val);
-                    }
-                    8 => {
-                        let val: u32 = tmp_str.parse().unwrap();
-                        number_of_trades.push(val);
-                    }
-                    9 => {
-                        let val: f64 = tmp_str.parse().unwrap();
-                        tbbav.push(val);
-                    }
-                    10 => {
-                        let val: f64 = tmp_str.parse().unwrap();
-                        tbqav.push(val);
-                    }
-                    _ => (),
-                }
-                tmp_bytes.clear();
-                index += 1;
-            }
-        }
-    }
-
-    Klines {
-        open_time,
-        open,
-        high,
-        low,
-        close,
-        _volume: volume,
-        _close_time: close_time,
-        _quote_asset_volume: quote_asset_volume,
-        _number_of_trades: number_of_trades,
-        _tbbav: tbbav,
-        _tbqav: tbqav,
-    }
-}
-
-pub struct Kline {
-    open: f64,
-    high: f64,
-    low: f64,
-    close: f64,
-    open_time: DateTime<Utc>,
-}
-
-impl Kline {
-    pub fn from_bytes(slice: &[u8]) -> Self {
-        let mut i: usize = 0;
-        let mut index: usize = 0;
-
-        let mut open: f64 = 0f64;
-        let mut high: f64 = 0f64;
-        let mut low: f64 = 0f64;
-        let mut close: f64 = 0f64;
-        let mut open_time: DateTime<Utc> = Utc.timestamp_millis(1004508300000);
-
-        let mut found_i = false;
-
-        for (count, &element) in slice.iter().enumerate() {
-            if element.is_ascii_digit() && !found_i {
-                found_i = true;
-                i = count;
-            }
-
-            if found_i && (element == b'"' || element == b',') {
-                let s = std::str::from_utf8(&slice[i..count]).unwrap();
-
-                match index {
-                    0 => open_time = Utc.timestamp_millis(s.parse().unwrap()),
-                    1 => open = s.parse().unwrap(),
-                    2 => high = s.parse().unwrap(),
-                    3 => low = s.parse().unwrap(),
-                    4 => {
-                        close = s.parse().unwrap();
-                        break;
-                    }
-                    _ => (),
-                }
-
-                index += 1;
-                found_i = false;
-            }
-        }
-
-        Self {
-            open,
-            high,
-            low,
-            close,
-            open_time,
-        }
-    }
-
-    pub fn open(&self) -> f64 {
-        self.open
-    }
-
-    pub fn high(&self) -> f64 {
-        self.high
-    }
-
-    pub fn low(&self) -> f64 {
-        self.low
-    }
-
-    pub fn close(&self) -> f64 {
-        self.close
-    }
-
-    pub fn time(&self) -> DateTime<Utc> {
-        self.open_time
     }
 }
 
@@ -543,7 +427,7 @@ mod tests {
     }
 
     #[test]
-    fn test_order() {
+    fn new_order() {
         let binance = Account::new();
 
         let parameters = format!(
@@ -558,7 +442,7 @@ mod tests {
     }
 
     #[test]
-    fn invalid_test_order() {
+    fn invalid_order() {
         let binance = Account::new();
 
         let parameters = format!(
@@ -569,19 +453,5 @@ mod tests {
         let response = binance.test_order(parameters);
 
         assert!(response.is_err());
-    }
-
-    #[test]
-    fn symbol() {
-        let a = Symbol::new("CAKE", "USDT");
-        let b = Symbol::new("CAKE", "USDT");
-        let c = Symbol::new("BTC", "USDT");
-
-        assert_eq!(a.as_str(), "CAKEUSDT");
-        assert_eq!(a.base(), "CAKE");
-        assert_eq!(a.quote(), "USDT");
-
-        assert_eq!(a, b);
-        assert_ne!(a, c);
     }
 }

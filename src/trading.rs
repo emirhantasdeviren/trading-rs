@@ -1,418 +1,79 @@
-use std::fs;
+use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use chrono::{DateTime, TimeZone, Utc};
+use chrono::{DateTime, FixedOffset, TimeZone, Utc};
 
-use crate::exchange::binance::{self, Account, Interval, Kline, Klines, Symbol};
-use crate::finder::Haystack;
-use crate::indicators::{Adx, BollingerBand};
-
-#[derive(Clone, Copy)]
-pub enum Mode {
-    Backtest,
-    Live,
-}
+use crate::exchange::binance::{Account, Asset, SymbolString};
+use crate::exchange::{Interval, Kline};
+use crate::indicators::{BollingerBand, Dema, Dmi, TdSeq};
+use crate::parser::TomlParser;
+use crate::telegram;
 
 pub struct Trader {
+    binance: Account,
+    telegram: telegram::Bot,
     start_time: DateTime<Utc>,
-    end_time: DateTime<Utc>,
-    symbol: Symbol,
+    symbols: Vec<Symbol>,
+    assets: Vec<Asset>,
     interval: Interval,
-    mode: Mode,
-    quote: f64,
-    base: f64,
-    precision: usize,
 }
 
 impl Trader {
-    fn get_balance(binance: &Account, asset: &str) -> f64 {
-        let response = binance
-            .account_information()
-            .expect("Could not get account information");
-        let bytes = response.bytes().unwrap();
+    pub fn new(binance: Account, interval: Interval) -> Self {
+        let start_time = {
+            let now = Utc::now().timestamp_millis();
+            let interval = interval.to_millis();
+            Utc.timestamp_millis(now + interval - now % interval)
+        };
 
-        let mut haystack = Haystack::new(&bytes);
-        let mut balance = String::new();
+        let mut f = File::open("cache.toml").unwrap();
+        let mut buf = Vec::new();
+        f.read_to_end(&mut buf).unwrap();
+        let mut parser = TomlParser::new(&buf);
+        let (assets, symbols) = parser.load_cache();
 
-        haystack.find_key("balances");
+        println!("[INFO] Start Time: {}", start_time);
+        print!("[INFO] Symbols: ");
 
-        haystack.find_pair("asset", asset);
-        haystack.find_key("free");
-
-        while let Some(b) = haystack.peek() {
-            if **b == b'"' {
-                haystack.next().unwrap();
-                break;
-            }
-
-            haystack.next().unwrap();
-        }
-
-        while let Some(b) = haystack.peek() {
-            if b.is_ascii_digit() || **b == b'.' {
-                balance.push(char::from(**b));
-            }
-
-            if **b == b'"' {
-                break;
-            }
-
-            haystack.next().unwrap();
-        }
-
-        balance.parse().unwrap()
-    }
-
-    fn get_precision(symbol: &str) -> usize {
-        let mut f = fs::File::open("exchangeInfo.json").expect("Could not open exchangeInfo.json");
-        let mut buffer = Vec::new();
-        f.read_to_end(&mut buffer).unwrap();
-
-        let mut haystack = Haystack::new(&buffer);
-        let mut precision: Option<usize> = None;
-
-        haystack.find_key("symbols");
-
-        haystack.find_pair("symbol", symbol);
-        haystack.find_key("filters");
-
-        haystack.find_pair("filterType", "LOT_SIZE");
-        haystack.find_key("stepSize");
-
-        while let Some(b) = haystack.peek() {
-            if let Some(ref mut p) = precision {
-                *p += 1;
-                if **b == b'1' {
-                    break;
-                }
+        for (i, symbol) in symbols.iter().enumerate() {
+            if i < symbols.len() - 1 {
+                print!("{}, ", symbol.as_str());
             } else {
-                if **b == b'1' {
-                    precision = Some(0);
-                    break;
-                }
-
-                if **b == b'.' {
-                    precision = Some(0);
-                }
-
-                if **b == b',' {
-                    break;
-                }
+                println!("{}\n", symbol.as_str());
             }
-
-            haystack.next().unwrap();
         }
 
-        precision.expect("Could not find precision of given symbol")
-    }
+        println!("[INFO] Assets:");
+        for asset in assets.iter() {
+            println!("    {}: {:.8}", &asset.name, asset.balance);
+        }
 
-    pub fn new(
-        binance: &Account,
-        start_time: DateTime<Utc>,
-        end_time: DateTime<Utc>,
-        symbol: Symbol,
-        interval: Interval,
-        mode: Mode,
-        start_amount: f64,
-    ) -> Self {
-        let start_time = match mode {
-            Mode::Live => {
-                let now = Utc::now().timestamp_millis();
-                let interval = interval.to_millis();
-                Utc.timestamp_millis(now + interval - now % interval)
-            }
-            Mode::Backtest => start_time,
-        };
-
-        let start_amount = match mode {
-            Mode::Live => Self::get_balance(binance, symbol.quote()),
-            Mode::Backtest => start_amount,
-        };
-
-        let precision = Self::get_precision(symbol.as_str());
-
-        let base = match mode {
-            Mode::Live => {
-                let mut base = Self::get_balance(binance, symbol.base());
-                base -= base % 10f64.powi(-(precision as i32));
-                base
-            }
-            Mode::Backtest => 0f64,
-        };
-
-        println!(
-            "[INFO] Start Time: {}, Symbol: {}, Interval: {}\n[INFO] {} Balance: {}\n[INFO] {} Balance: {}\n",
-            start_time, symbol, interval, symbol.base(), base, symbol.quote(), start_amount,
-        );
+        println!("\n[INFO] Interval: {}", interval);
 
         Self {
+            binance,
+            telegram: telegram::Bot::new(),
             start_time,
-            end_time,
-            symbol,
+            symbols,
+            assets,
             interval,
-            mode,
-            quote: start_amount,
-            base,
-            precision,
         }
     }
 
-    fn get_required_data(&self, binance: &Account) -> Klines {
-        let interval: i64 = self.interval.to_millis();
-        let prev_time = self.start_time.timestamp_millis() - interval;
+    pub fn run(&mut self) {
+        let data = self.get_required_data();
 
-        match self.mode {
-            Mode::Backtest => {
-                let data_count = (self.end_time.timestamp_millis()
-                    - self.start_time.timestamp_millis())
-                    / interval;
+        for (i, klines) in data.into_iter().enumerate() {
+            let mut prev_kline = klines.first().unwrap();
 
-                let iteration = if data_count % 1000 == 0 {
-                    data_count / 1000
-                } else {
-                    data_count / 1000 + 1
-                };
+            for kline in klines.iter().skip(1) {
+                self.symbols[i].indicators.update(kline, prev_kline);
+                self.symbols[i].kline.update(kline);
 
-                let path = self.file_name();
-
-                match std::fs::OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .create_new(true)
-                    .open(&path)
-                {
-                    Ok(mut f) => {
-                        let response = binance
-                            .get_kline_data(
-                                &self.symbol,
-                                self.interval,
-                                None,
-                                Some(prev_time),
-                                Some(1000),
-                            )
-                            .expect("Could not get kline data");
-                        f.write_all(&response.bytes().unwrap()).unwrap();
-
-                        for i in 0..iteration {
-                            let start_time =
-                                self.start_time.timestamp_millis() + (i * interval * 1000);
-                            let response = binance
-                                .get_kline_data(
-                                    &self.symbol,
-                                    self.interval,
-                                    Some(start_time),
-                                    Some(self.end_time.timestamp_millis()),
-                                    Some(1000),
-                                )
-                                .expect("Could not get kline data");
-
-                            f.write_all(&response.bytes().unwrap()).unwrap();
-                        }
-
-                        f.sync_all().unwrap();
-                        f.seek(SeekFrom::Start(0)).unwrap();
-                        let mut bytes = Vec::new();
-                        f.read_to_end(&mut bytes).unwrap();
-
-                        binance::parse_kline_body(&bytes, (data_count + 1000) as usize)
-                    }
-                    Err(e) => match e.kind() {
-                        std::io::ErrorKind::AlreadyExists => {
-                            let mut f = std::fs::File::open(&path).unwrap();
-                            let mut bytes = Vec::new();
-                            f.read_to_end(&mut bytes).unwrap();
-
-                            binance::parse_kline_body(&bytes, (data_count + 1000) as usize)
-                        }
-                        kind => panic!("Could not create file: {:?}", kind),
-                    },
-                }
-            }
-            Mode::Live => {
-                let prev_time = prev_time - interval;
-                let response = binance
-                    .get_kline_data(
-                        &self.symbol,
-                        self.interval,
-                        None,
-                        Some(prev_time),
-                        Some(1000),
-                    )
-                    .expect("Could not get kline data");
-                binance::parse_kline_body(&response.bytes().unwrap(), 1000)
-            }
-        }
-    }
-
-    fn market_buy(&self, binance: &Account) {
-        let quanity = format!("quoteOrderQty={}", self.quote);
-
-        let parameters = format!(
-            "symbol={}&side=BUY&type=MARKET&{}&timestamp={}",
-            &self.symbol,
-            quanity,
-            Utc::now().timestamp_millis(),
-        );
-
-        binance
-            .new_order(parameters)
-            .expect("Could not send new order");
-    }
-
-    fn market_sell(&self, binance: &Account) {
-        let quanity = format!("quantity={}", self.base);
-
-        let parameters = format!(
-            "symbol={}&side=SELL&type=MARKET&{}&timestamp={}",
-            &self.symbol,
-            quanity,
-            Utc::now().timestamp_millis(),
-        );
-
-        binance
-            .new_order(parameters)
-            .expect("Could not send new order");
-    }
-
-    fn file_name(&self) -> String {
-        format!(
-            "./data/{}_{}_{}.txt",
-            &self.symbol,
-            self.start_time.naive_utc().date(),
-            self.interval,
-        )
-    }
-
-    fn backtest(&mut self, data: Klines) {
-        let mut bb = BollingerBand::new(20, 2f64);
-        let mut adx = Adx::new(14);
-
-        let mut net: f64 = 0f64;
-        let mut p_trade = 0;
-        let mut n_trade = 0;
-
-        let mut uptrend_buy_case = false;
-
-        for index in 0..data.close.len() {
-            let &high = data.high.get(index).unwrap();
-            let &low = data.low.get(index).unwrap();
-            let &close = data.close.get(index).unwrap();
-            bb.next(close);
-
-            if let Some(prev_index) = index.checked_sub(1) {
-                let &high_prev = data.high.get(prev_index).unwrap();
-                let &low_prev = data.low.get(prev_index).unwrap();
-                let &close_prev = data.close.get(prev_index).unwrap();
-                adx.next(high, high_prev, low, low_prev, close_prev);
-            }
-
-            if self.start_time.timestamp_millis()
-                <= data.open_time.get(index).unwrap().timestamp_millis()
-            {
-                if let (
-                    Some((mean, bb_upper, bb_lower)),
-                    (Some(adx_val), Some(pdi_val), Some(mdi_val)),
-                ) = (bb.get(), adx.get())
-                {
-                    if self.base.abs() < f64::EPSILON {
-                        /*
-                        let bound = if adx_val < 15f64 {
-                            bb_lower
-                        } else {
-                            bb_lower - bb.dev().unwrap() / 2f64
-                        };
-                        */
-                        let ult_lower = bb_lower - bb.dev().unwrap() / 2f64;
-                        let bb_lower_condition = (adx_val < 15f64 && close < bb_lower)
-                            || (adx_val < 25f64 && low < ult_lower);
-
-                        let moving_average_condition = pdi_val > mdi_val
-                            && adx_val > 25f64
-                            && low > mean
-                            && low < mean + bb.dev().unwrap() / 2f64;
-                        uptrend_buy_case = moving_average_condition;
-
-                        if bb_lower_condition || moving_average_condition {
-                            self.base = self.quote / close;
-                            net = self.quote;
-                            self.quote = 0f64;
-                            if moving_average_condition {
-                                println!("TO THE MOON!");
-                            }
-                            println!(
-                                "{}: Bought {:.4} amount coin    BB: {:<16.4}{:<16.4}{:<16.4}ADX: {:<16.4}+DI: {:<16.4}-DI: {:<16.4}PRICE: {:<16.4}",
-                                data.open_time.get(index).unwrap(),
-                                self.base,
-                                mean,
-                                bb_upper,
-                                bb_lower,
-                                adx_val,
-                                pdi_val,
-                                mdi_val,
-                                close,
-                            );
-                        }
-                    } else {
-                        let conditional_net = ((self.base * close) / net) - 1f64;
-                        let moving_average_condition =
-                            close > mean && conditional_net.is_sign_positive() && !uptrend_buy_case;
-                        let bb_upper_condition = close > bb_upper;
-
-                        if moving_average_condition || bb_upper_condition {
-                            self.quote = self.base * close;
-                            net = ((self.quote / net) - 1f64) * 100f64;
-                            println!(
-                                "{}: Sold   {:.4} amount coin    BB: {:<16.4}{:<16.4}{:<16.4}ADX:{:<16.4}+DI: {:<16.4}-DI: {:<16.4}PRICE: {:<16.4}NET: {:<+16.4}\n",
-                                data.open_time.get(index).unwrap(),
-                                self.base,
-                                mean,
-                                bb_upper,
-                                bb_lower,
-                                adx_val,
-                                pdi_val,
-                                mdi_val,
-                                close,
-                                net
-                            );
-                            self.base = 0f64;
-
-                            if net.is_sign_positive() {
-                                p_trade += 1;
-                            } else {
-                                n_trade += 1;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        println!("Positive trade: {}", p_trade);
-        println!("Negative trade: {}", n_trade);
-        println!("Result: {}", self.base * data.close.last().unwrap());
-        println!("Result: {}", self.quote);
-    }
-
-    fn live(&mut self, binance: Account) {
-        let data = self.get_required_data(&binance);
-        let mut bb = BollingerBand::new(20, 2f64);
-        let mut adx = Adx::new(14);
-
-        let mut net = 0f64;
-        let _uptrend_buy_case = false;
-
-        for index in 0..data.close.len() {
-            let &high = data.high.get(index).unwrap();
-            let &low = data.low.get(index).unwrap();
-            let &close = data.close.get(index).unwrap();
-            bb.next(close);
-
-            if let Some(prev_index) = index.checked_sub(1) {
-                let &high_prev = data.high.get(prev_index).unwrap();
-                let &low_prev = data.low.get(prev_index).unwrap();
-                let &close_prev = data.close.get(prev_index).unwrap();
-                adx.next(high, high_prev, low, low_prev, close_prev);
+                prev_kline = kline;
             }
         }
 
@@ -430,11 +91,13 @@ impl Trader {
             }
         });
 
-        let mut prev_kline = data.last();
-
         loop {
             let timeout = std::time::Duration::from_millis(
-                (close_time - Utc::now().timestamp_millis()) as u64,
+                (close_time
+                    - SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .expect("system time before Unix epoch")
+                        .as_millis() as i64) as u64,
             );
             match rx.recv_timeout(timeout) {
                 Ok(_) => {
@@ -443,104 +106,60 @@ impl Trader {
                     break;
                 }
                 Err(RecvTimeoutError::Timeout) => {
-                    let response = binance
-                        .get_kline_data(
-                            &self.symbol,
-                            self.interval,
-                            None,
-                            Some(close_time),
-                            Some(1),
-                        )
-                        .expect("Could not get kline data");
+                    for symbol in self.symbols.iter_mut() {
+                        let response = self
+                            .binance
+                            .get_kline_data(
+                                symbol.as_str(),
+                                self.interval,
+                                None,
+                                Some(close_time),
+                                Some(1),
+                            )
+                            .expect("Could not get kline data");
 
-                    let kline = Kline::from_bytes(&response.bytes().unwrap());
+                        let kline = Kline::parse_array(&response.bytes().unwrap());
 
-                    let open_time = kline.time();
-                    let high = kline.high();
-                    let prev_high = prev_kline.high();
-                    let low = kline.low();
-                    let prev_low = prev_kline.low();
-                    let close = kline.close();
-                    let prev_close = prev_kline.close();
+                        symbol.indicators.update(&kline, &symbol.kline);
+                        symbol.kline.update(&kline);
+                    }
 
-                    bb.next(close);
-                    adx.next(high, prev_high, low, prev_low, prev_close);
-
-                    if let (
-                        Some((mean, bb_upper, bb_lower)),
-                        (Some(adx_val), Some(pdi_val), Some(mdi_val)),
-                    ) = (bb.get(), adx.get())
-                    {
-                        println!(
-                            "[TRACE {}] Checking conditions. BB: {:<16.4}{:<16.4}{:<16.4}ADX: {:<16.4}+DI: {:<16.4}-DI: {:<16.4}CLOSE: {:<16.4}",
-                            open_time,
-                            mean,
-                            bb_upper,
-                            bb_lower,
-                            adx_val,
-                            pdi_val,
-                            mdi_val,
-                            close,
-                        );
-                        if self.base.abs() < f64::EPSILON {
-                            let bound = if adx_val < 15f64 {
-                                bb_lower
-                            } else {
-                                bb_lower - bb.dev().unwrap() / 2f64
-                            };
-                            let bb_lower_condition = bound > close;
-                            let moving_average_condition = pdi_val > mdi_val
-                                && adx_val > 25f64
-                                && low > mean
-                                && low < mean + bb.dev().unwrap() / 2f64;
-                            // uptrend_buy_case = moving_average_condition;
-
-                            if bb_lower_condition || moving_average_condition {
-                                self.market_buy(&binance);
-                                self.base = Self::get_balance(&binance, self.symbol.base());
-                                self.base -= self.base % 10f64.powi(-(self.precision as i32));
-                                net = self.quote;
-                                self.quote = 0f64;
-
-                                println!(
-                                    "\n[BUY  {}] BB: {:<16.4}{:<16.4}{:<16.4}ADX: {:<16.4} +DI: {:<16.4}-DI: {:<16.4}PRICE: {:<16.4}",
-                                    open_time,
-                                    mean,
-                                    bb_upper,
-                                    bb_lower,
-                                    adx_val,
-                                    pdi_val,
-                                    mdi_val,
-                                    close,
-                                );
-                            }
-                        } else {
-                            let _conditional_net = ((self.base * close) / net) - 1f64;
-                            let moving_average_condition = close > mean;
-                            let bb_upper_condition = close > bb_upper;
-
-                            if bb_upper_condition {
-                                self.market_sell(&binance);
-                                self.quote = Self::get_balance(&binance, self.symbol.quote());
-                                net = ((self.quote / net) - 1f64) * 100f64;
-                                self.base = 0f64;
-
-                                println!(
-                                    "[SELL {}] BB: {:<16.4}{:<16.4}{:<16.4}ADX: {:<16.4} +DI: {:<16.4}-DI: {:<16.4}PRICE: {:<16.4}NET: {:<16.4}\n",
-                                    open_time,
-                                    mean,
-                                    bb_upper,
-                                    bb_lower,
-                                    adx_val,
-                                    pdi_val,
-                                    mdi_val,
-                                    close,
-                                    net,
-                                );
+                    let mut signals: Vec<Option<Signal>> = Vec::with_capacity(self.symbols.len());
+                    for symbol in self.symbols.iter() {
+                        let signal = symbol.check_conditions();
+                        if let Some(s) = signal {
+                            match s {
+                                Signal::Buy(_) => {
+                                    let msg = format!(
+                                        "[{}] {} Buy Signal",
+                                        FixedOffset::east(3)
+                                            .timestamp_millis(symbol.kline.open_time),
+                                        symbol.as_str()
+                                    );
+                                    self.telegram.send_message(&msg);
+                                }
+                                Signal::Sell => {
+                                    let msg = format!(
+                                        "[{}] {} Sell Signal",
+                                        FixedOffset::east(3)
+                                            .timestamp_millis(symbol.kline.open_time),
+                                        symbol.as_str()
+                                    );
+                                    self.telegram.send_message(&msg);
+                                }
                             }
                         }
+                        signals.push(signal);
                     }
-                    prev_kline = kline;
+
+                    for (i, signal) in signals.into_iter().enumerate() {
+                        if let Some(Signal::Buy(pos)) = signal {
+                            self.buy(i, pos);
+                        } else if let Some(Signal::Sell) = signal {
+                            self.sell(i);
+                        }
+                    }
+
                     close_time += interval;
                 }
                 Err(e) => panic!("{}", e),
@@ -548,13 +167,458 @@ impl Trader {
         }
     }
 
-    pub fn run(&mut self, binance: Account) {
-        match self.mode {
-            Mode::Backtest => {
-                let data = self.get_required_data(&binance);
-                self.backtest(data);
+    fn get_required_data(&self) -> Vec<Vec<Kline>> {
+        let interval: i64 = self.interval.to_millis();
+        let prev_time = self.start_time.timestamp_millis() - 2 * interval;
+        let mut klines_for_each_symbol = Vec::with_capacity(self.symbols.len());
+
+        for symbol in self.symbols.iter() {
+            let response = self
+                .binance
+                .get_kline_data(
+                    symbol.as_str(),
+                    self.interval,
+                    None,
+                    Some(prev_time),
+                    Some(1000),
+                )
+                .expect("Could not get kline data");
+
+            klines_for_each_symbol.push(Kline::parse_2d_array(&response.bytes().unwrap(), 1000));
+        }
+
+        klines_for_each_symbol
+    }
+
+    fn buy(&mut self, symbol_index: usize, pos: Position) {
+        let close_position_count = self
+            .symbols
+            .iter()
+            .filter(|symbol| symbol.position.is_none())
+            .count();
+        let symbol = self.symbols.get_mut(symbol_index).unwrap();
+        let mut quote = None;
+        let mut base = None;
+
+        for asset in self.assets.iter_mut() {
+            if symbol.quote() == &asset.name {
+                quote = Some(asset);
+            } else if symbol.base() == &asset.name {
+                base = Some(asset);
             }
-            Mode::Live => self.live(binance),
+        }
+
+        let quote = quote.unwrap();
+        let base = base.unwrap();
+        let quote_order_quantity = quote.balance / (close_position_count as f64);
+
+        if quote_order_quantity > 10f64 {
+            self.binance
+                .market_buy(symbol.as_str(), quote_order_quantity)
+                .expect("Could not buy the coin");
+
+            println!(
+                "[{}] Bought {} with {} {}",
+                Utc.timestamp_millis(symbol.kline.open_time),
+                symbol.base(),
+                quote_order_quantity,
+                symbol.quote(),
+            );
+
+            symbol.net = symbol.kline.close;
+            symbol.position = Some(pos);
+
+            base.balance = self
+                .binance
+                .get_balance(symbol.base())
+                .expect("Could not get balance");
+            quote.balance = self
+                .binance
+                .get_balance(symbol.quote())
+                .expect("Could not get balance");
+        } else {
+            println!(
+                "[{}] {} MIN_NOTIONAL Filter: {} < 10",
+                Utc.timestamp_millis(symbol.kline.open_time),
+                symbol.as_str(),
+                quote_order_quantity,
+            );
         }
     }
+
+    fn sell(&mut self, symbol_index: usize) {
+        let symbol = self.symbols.get_mut(symbol_index).unwrap();
+        let mut quote = None;
+        let mut base = None;
+
+        for asset in self.assets.iter_mut() {
+            if symbol.quote() == &asset.name {
+                quote = Some(asset);
+            } else if symbol.base() == &asset.name {
+                base = Some(asset);
+            }
+        }
+
+        let quote = quote.unwrap();
+        let base = base.unwrap();
+
+        base.balance -= base.balance % 10f64.powi(-symbol.step_size);
+
+        self.binance
+            .market_sell(symbol.as_str(), base.balance)
+            .expect("Could not sell the coin");
+
+        println!(
+            "[{}] Sold {} {} NET: {:.1}%",
+            Utc.timestamp_millis(symbol.kline.open_time),
+            base.balance,
+            symbol.base(),
+            (symbol.kline.close / symbol.net - 1f64) * 100f64,
+        );
+
+        symbol.net = 0f64;
+        symbol.position = None;
+
+        quote.balance = self
+            .binance
+            .get_balance(symbol.quote())
+            .expect("Could not get balance");
+        base.balance = 0f64;
+    }
+}
+
+pub struct Backtester {
+    start_time: DateTime<Utc>,
+    end_time: DateTime<Utc>,
+    symbol: Symbol,
+    base: Asset,
+    quote: Asset,
+    interval: Interval,
+    net: f64,
+}
+
+impl Backtester {
+    pub fn new(
+        start_time: DateTime<Utc>,
+        end_time: DateTime<Utc>,
+        symbol: Symbol,
+        interval: Interval,
+    ) -> Self {
+        let base = Asset::new(symbol.base(), 0f64);
+        let quote = Asset::new(symbol.quote(), 100f64);
+
+        println!("[INFO] Symbol: {}\n", symbol.as_str());
+        println!("[INFO] Start Time: {}", start_time);
+        println!("[INFO] End Time: {}\n", end_time);
+        println!(
+            "[INFO] {} Balance: {}\n       {} Balance: {}",
+            &base.name, base.balance, &quote.name, quote.balance
+        );
+        println!("[INFO] Interval: {}\n", interval);
+
+        Self {
+            start_time,
+            end_time,
+            symbol,
+            base,
+            quote,
+            interval,
+            net: 0f64,
+        }
+    }
+
+    pub fn run(&mut self, binance: Account) {
+        let klines = self.get_required_data(&binance);
+        let mut prev_kline = klines.first().unwrap();
+
+        for kline in klines.iter().skip(1) {
+            self.symbol.kline.update(kline);
+            self.symbol.indicators.update(kline, prev_kline);
+
+            if self.start_time.timestamp_millis() <= kline.open_time {
+                match self.symbol.check_conditions() {
+                    Some(Signal::Buy(pos)) => {
+                        self.buy();
+                        self.symbol.net = self.symbol.kline.close;
+                        self.symbol.position = Some(pos);
+                    }
+                    Some(Signal::Sell) => {
+                        self.sell();
+                        self.symbol.position = None;
+                    }
+                    None => (),
+                }
+            }
+
+            prev_kline = kline;
+        }
+
+        if self.symbol.position.is_none() {
+            println!("ROI: {:.1}%", (self.quote.balance / 100f64 - 1f64) * 100f64);
+        } else {
+            println!(
+                "ROI: {:.1}%",
+                (self.base.balance * klines.last().unwrap().close / 100f64 - 1f64) * 100f64
+            );
+        }
+    }
+
+    fn get_required_data(&self, binance: &Account) -> Vec<Kline> {
+        let interval: i64 = self.interval.to_millis();
+        let prev_time = self.start_time.timestamp_millis() - interval;
+
+        let data_count =
+            (self.end_time.timestamp_millis() - self.start_time.timestamp_millis()) / interval;
+
+        let iteration = if data_count % 1000 == 0 {
+            data_count / 1000
+        } else {
+            data_count / 1000 + 1
+        };
+
+        let path = format!(
+            "./data/{}_{}_{}.txt",
+            self.symbol.as_str(),
+            self.start_time.naive_utc().date(),
+            self.interval
+        );
+
+        match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(mut f) => {
+                let response = binance
+                    .get_kline_data(
+                        self.symbol.as_str(),
+                        self.interval,
+                        None,
+                        Some(prev_time),
+                        Some(1000),
+                    )
+                    .expect("Could not get kline data");
+                f.write_all(&response.bytes().unwrap()).unwrap();
+
+                for i in 0..iteration {
+                    let start_time = self.start_time.timestamp_millis() + (i * interval * 1000);
+                    let response = binance
+                        .get_kline_data(
+                            self.symbol.as_str(),
+                            self.interval,
+                            Some(start_time),
+                            Some(self.end_time.timestamp_millis()),
+                            Some(1000),
+                        )
+                        .expect("Could not get kline data");
+                    f.write_all(&response.bytes().unwrap()).unwrap();
+                }
+
+                f.sync_all().unwrap();
+                f.seek(SeekFrom::Start(0)).unwrap();
+                let mut bytes = Vec::new();
+                f.read_to_end(&mut bytes).unwrap();
+
+                Kline::parse_2d_array(&bytes, (data_count + 1000) as usize)
+            }
+            Err(e) => match e.kind() {
+                std::io::ErrorKind::AlreadyExists => {
+                    let mut f = std::fs::File::open(&path).unwrap();
+                    let mut bytes = Vec::new();
+                    f.read_to_end(&mut bytes).unwrap();
+
+                    Kline::parse_2d_array(&bytes, (data_count + 1000) as usize)
+                }
+                _ => panic!("{:?}", e),
+            },
+        }
+    }
+
+    fn buy(&mut self) {
+        self.net = self.symbol.kline.close;
+        self.base.balance = self.quote.balance / self.symbol.kline.close;
+        self.quote.balance = 0f64;
+        println!(
+            "[INFO] BUY  {}: PRICE: {:.4}",
+            Utc.timestamp_millis(self.symbol.kline.open_time),
+            self.symbol.kline.close
+        );
+    }
+
+    fn sell(&mut self) {
+        self.net = (self.symbol.kline.close / self.net - 1f64) * 100f64;
+        self.quote.balance = self.base.balance * self.symbol.kline.close;
+        self.base.balance = 0f64;
+        println!(
+            "[INFO] SELL {}: PRICE: {:.4}    NET: {:.4}\n",
+            Utc.timestamp_millis(self.symbol.kline.open_time),
+            self.symbol.kline.close,
+            self.net,
+        );
+    }
+}
+
+pub struct Symbol {
+    name: SymbolString,
+    indicators: Indicators,
+    kline: Kline,
+    step_size: i32,
+    position: Option<Position>,
+    net: f64,
+}
+
+impl Symbol {
+    pub fn new(base: &str, quote: &str) -> Self {
+        Self {
+            name: SymbolString::new(base, quote),
+            indicators: Indicators::default(),
+            kline: Kline::default(),
+            step_size: 8,
+            position: Option::default(),
+            net: 0f64,
+        }
+    }
+
+    pub fn from_string(inner: String, mid: usize, step_size: i32) -> Self {
+        Self {
+            name: SymbolString::from_raw_parts(inner, mid),
+            indicators: Indicators::default(),
+            kline: Kline::default(),
+            step_size,
+            position: Option::default(),
+            net: 0f64,
+        }
+    }
+
+    fn check_conditions(&self) -> Option<Signal> {
+        if let (Some((basis, upper, lower)), (Some(adx), Some(pdi), Some(mdi)), Some(dema)) = (
+            self.indicators.bb.get(),
+            self.indicators.dmi.get(),
+            self.indicators.dema.get(),
+        ) {
+            match self.position {
+                None => {
+                    let bound = if adx > 15f64 {
+                        lower - self.indicators.bb.dev().unwrap() / 2f64
+                    } else {
+                        lower
+                    };
+
+                    let buy_the_dip = self.kline.close < bound;
+
+                    let to_the_moon = pdi > mdi
+                        && adx > 25f64
+                        && adx < 40f64
+                        && adx > dema
+                        && self.kline.low > basis
+                        && self.kline.low < basis + self.indicators.bb.dev().unwrap() / 2f64;
+
+                    if buy_the_dip {
+                        Some(Signal::Buy(Position::Dip))
+                    } else if to_the_moon {
+                        Some(Signal::Buy(Position::Mean))
+                    } else {
+                        None
+                    }
+                }
+                Some(Position::Dip) => {
+                    let conditional_net = self.kline.close / self.net - 1f64;
+
+                    if (conditional_net.is_sign_positive() && self.kline.close > basis)
+                        || self.kline.close > upper
+                    {
+                        Some(Signal::Sell)
+                    } else {
+                        None
+                    }
+                }
+                Some(Position::Mean) => {
+                    let at_the_moon =
+                        pdi > mdi && adx > 25f64 && dema > adx && self.indicators.was_perfect;
+
+                    if at_the_moon {
+                        Some(Signal::Sell)
+                    } else {
+                        None
+                    }
+                }
+            }
+        } else {
+            None
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        self.name.as_str()
+    }
+
+    pub fn base(&self) -> &str {
+        self.name.base()
+    }
+
+    pub fn quote(&self) -> &str {
+        self.name.quote()
+    }
+}
+
+struct Indicators {
+    dmi: Dmi,
+    bb: BollingerBand<20>,
+    dema: Dema,
+    td_seq: TdSeq,
+    was_perfect: bool,
+}
+
+impl Default for Indicators {
+    fn default() -> Self {
+        Self {
+            dmi: Dmi::new(14),
+            bb: BollingerBand::new(2f64),
+            dema: Dema::new(9),
+            td_seq: TdSeq::new(),
+            was_perfect: false,
+        }
+    }
+}
+
+impl Indicators {
+    pub fn update(&mut self, kline: &Kline, prev_kline: &Kline) {
+        self.dmi.next(
+            kline.high,
+            prev_kline.high,
+            kline.low,
+            prev_kline.low,
+            prev_kline.close,
+        );
+        self.bb.next(kline.close);
+
+        if let Some(adx) = self.dmi.get().0 {
+            self.dema.next(adx);
+        }
+
+        self.td_seq.next(kline.high, kline.low, kline.close);
+
+        if let ((Some(adx), Some(pdi), Some(mdi)), Some(dema)) = (self.dmi.get(), self.dema.get()) {
+            if self.td_seq.sell_perfect() && adx > dema && pdi > mdi && adx > 25f64 {
+                self.was_perfect = true;
+            }
+
+            if self.was_perfect && adx < 25f64 {
+                self.was_perfect = false;
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Signal {
+    Buy(Position),
+    Sell,
+}
+
+#[derive(Clone, Copy)]
+enum Position {
+    Dip,
+    Mean,
 }

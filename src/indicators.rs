@@ -1,35 +1,33 @@
-pub struct Sma {
-    period: usize,
-    data: Box<[f64]>,
+pub struct Sma<const N: usize> {
+    data: [f64; N],
     index: usize,
     value: Option<f64>,
 }
 
-impl Sma {
-    pub fn new(period: usize) -> Self {
+impl<const N: usize> Sma<N> {
+    pub fn new() -> Self {
         Self {
-            period,
-            data: vec![f64::NAN; period].into_boxed_slice(),
+            data: [f64::NAN; N],
             index: 0,
             value: None,
         }
     }
 
-    pub fn next(&mut self, value: f64) {
+    pub fn next(&mut self, source: f64) {
         if self.data[self.index].is_nan() {
-            self.data[self.index] = value;
+            self.data[self.index] = source;
 
-            if self.index < self.period - 1 {
+            if self.index < N - 1 {
                 self.index += 1;
             } else {
-                self.value = Some(self.data.iter().sum::<f64>() / self.period as f64);
+                self.value = Some(self.data.iter().sum::<f64>() / N as f64);
                 self.index = 0;
             }
         } else {
-            self.data[self.index] = value;
-            self.value = Some(self.data.iter().sum::<f64>() / self.period as f64);
+            self.data[self.index] = source;
+            self.value = Some(self.data.iter().sum::<f64>() / N as f64);
 
-            if self.index < self.period - 1 {
+            if self.index < N - 1 {
                 self.index += 1;
             } else {
                 self.index = 0;
@@ -42,53 +40,47 @@ impl Sma {
     }
 }
 
-pub struct StandardDeviation {
-    period: usize,
+pub struct StandardDeviation<const N: usize> {
+    data: [f64; N],
     index: usize,
-    data: Box<[f64]>,
     value: Option<f64>,
 }
 
-impl StandardDeviation {
-    pub fn new(period: usize) -> Self {
+impl<const N: usize> StandardDeviation<N> {
+    pub fn new() -> Self {
         Self {
-            period,
+            data: [f64::NAN; N],
             index: 0,
-            data: vec![f64::NAN; period].into_boxed_slice(),
             value: None,
         }
     }
 
-    pub fn next(&mut self, value: f64) {
+    pub fn next(&mut self, source: f64) {
         if self.data[self.index].is_nan() {
-            self.data[self.index] = value;
+            self.data[self.index] = source;
 
-            if self.index < self.period - 1 {
+            if self.index < N - 1 {
+                self.index += 1;
+            } else {
+                let mean = self.data.iter().sum::<f64>() / N as f64;
+                self.value = Some(
+                    (self.data.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / N as f64).sqrt(),
+                );
+
+                self.index = 0;
+            }
+        } else {
+            self.data[self.index] = source;
+
+            let mean = self.data.iter().sum::<f64>() / N as f64;
+            self.value =
+                Some((self.data.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / N as f64).sqrt());
+
+            if self.index < N - 1 {
                 self.index += 1;
             } else {
                 self.index = 0;
-
-                let mean = self.data.iter().sum::<f64>() / self.period as f64;
-                self.value = Some(
-                    (self.data.iter().map(|v| (v - mean).powi(2)).sum::<f64>()
-                        / self.period as f64)
-                        .sqrt(),
-                );
             }
-        } else {
-            self.data[self.index] = value;
-
-            if self.index < self.period - 1 {
-                self.index += 1;
-            } else if self.index == self.period - 1 {
-                self.index = 0;
-            }
-
-            let mean = self.data.iter().sum::<f64>() / self.period as f64;
-            self.value = Some(
-                (self.data.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / self.period as f64)
-                    .sqrt(),
-            );
         }
     }
 
@@ -116,7 +108,7 @@ impl Ema {
         }
     }
 
-    pub fn new_with_constant(period: usize, alpha: f64) -> Self {
+    pub fn with_constant(period: usize, alpha: f64) -> Self {
         Self {
             period,
             index: 0,
@@ -126,23 +118,53 @@ impl Ema {
         }
     }
 
-    pub fn next(&mut self, price: f64) {
+    pub fn next(&mut self, source: f64) {
         if self.index < self.period - 1 {
-            self.current += price;
+            self.current += source;
             self.index += 1;
         } else if self.index == self.period - 1 {
-            self.current += price;
+            self.current += source;
             self.current /= self.period as f64;
             self.value = Some(self.current);
             self.index += 1;
         } else {
-            self.current += self.alpha * (price - self.current);
+            self.current += self.alpha * (source - self.current);
             self.value = Some(self.current);
         }
     }
 
     pub fn get(&self) -> Option<f64> {
         self.value
+    }
+}
+
+pub struct Dema {
+    inner: Ema,
+    double: Ema,
+}
+
+impl Dema {
+    pub fn new(period: usize) -> Self {
+        Self {
+            inner: Ema::new(period),
+            double: Ema::new(period),
+        }
+    }
+
+    pub fn next(&mut self, source: f64) {
+        self.inner.next(source);
+
+        if let Some(ema) = self.inner.get() {
+            self.double.next(ema);
+        }
+    }
+
+    pub fn get(&self) -> Option<f64> {
+        if let (Some(ema), Some(double_ema)) = (self.inner.get(), self.double.get()) {
+            Some(2f64 * ema - double_ema)
+        } else {
+            None
+        }
     }
 }
 
@@ -161,9 +183,9 @@ impl Macd {
         }
     }
 
-    pub fn next(&mut self, price: f64) {
-        self.fast.next(price);
-        self.slow.next(price);
+    pub fn next(&mut self, source: f64) {
+        self.fast.next(source);
+        self.slow.next(source);
 
         match (self.fast.get(), self.slow.get()) {
             (Some(fast), Some(slow)) => self.signal.next(fast - slow),
@@ -182,31 +204,22 @@ impl Macd {
             _ => (None, None, None),
         }
     }
-
-    pub fn is_positive(&self) -> Option<bool> {
-        match (self.fast.get(), self.slow.get(), self.signal.get()) {
-            (Some(fast), Some(slow), Some(signal)) => {
-                Some(((fast - slow) - signal).is_sign_positive())
-            }
-            _ => None,
-        }
-    }
 }
 
 pub struct Atr {
     period: usize,
+    index: usize,
     value: Option<f64>,
     current: f64,
-    index: usize,
 }
 
 impl Atr {
     pub fn new(period: usize) -> Self {
         Self {
             period,
+            index: 0,
             value: None,
             current: 0f64,
-            index: 0,
         }
     }
 
@@ -233,7 +246,7 @@ impl Atr {
     }
 }
 
-pub struct Adx {
+pub struct Dmi {
     spdm: Ema,
     smdm: Ema,
     dx: Ema,
@@ -241,12 +254,12 @@ pub struct Adx {
     value: Option<f64>,
 }
 
-impl Adx {
+impl Dmi {
     pub fn new(period: usize) -> Self {
         Self {
-            spdm: Ema::new_with_constant(period, 1f64 / period as f64),
-            smdm: Ema::new_with_constant(period, 1f64 / period as f64),
-            dx: Ema::new_with_constant(period, 1f64 / period as f64),
+            spdm: Ema::with_constant(period, 1f64 / period as f64),
+            smdm: Ema::with_constant(period, 1f64 / period as f64),
+            dx: Ema::with_constant(period, 1f64 / period as f64),
             atr: Atr::new(period),
             value: None,
         }
@@ -306,8 +319,8 @@ pub struct Rsi {
 impl Rsi {
     pub fn new(period: usize) -> Self {
         Self {
-            smoothed_upward_change: Ema::new_with_constant(period, 1f64 / period as f64),
-            smoothed_downward_change: Ema::new_with_constant(period, 1f64 / period as f64),
+            smoothed_upward_change: Ema::with_constant(period, 1f64 / period as f64),
+            smoothed_downward_change: Ema::with_constant(period, 1f64 / period as f64),
             value: None,
         }
     }
@@ -339,20 +352,20 @@ impl Rsi {
     }
 }
 
-pub struct StochRsi {
+pub struct StochRsi<const N: usize> {
     rsi: Rsi,
     maximum: Maximum,
     minimum: Minimum,
-    value: Sma,
+    value: Sma<N>,
 }
 
-impl StochRsi {
-    pub fn new(period: usize) -> Self {
+impl<const N: usize> StochRsi<N> {
+    pub fn new() -> Self {
         Self {
-            rsi: Rsi::new(period),
-            maximum: Maximum::new(period),
-            minimum: Minimum::new(period),
-            value: Sma::new(3),
+            rsi: Rsi::new(N),
+            maximum: Maximum::new(N),
+            minimum: Minimum::new(N),
+            value: Sma::<N>::new(),
         }
     }
 
@@ -477,28 +490,26 @@ impl Minimum {
     }
 }
 
-pub struct BollingerBand {
-    typical_price: Sma,
-    dev: StandardDeviation,
+pub struct BollingerBand<const N: usize> {
+    typical_price: Sma<N>,
+    dev: StandardDeviation<N>,
     m: f64,
     value: Option<(f64, f64, f64)>,
 }
 
-impl BollingerBand {
-    pub fn new(period: usize, m: f64) -> Self {
+impl<const N: usize> BollingerBand<N> {
+    pub fn new(m: f64) -> Self {
         Self {
-            typical_price: Sma::new(period),
-            dev: StandardDeviation::new(period),
+            typical_price: Sma::<N>::new(),
+            dev: StandardDeviation::<N>::new(),
             m,
             value: None,
         }
     }
 
-    // pub fn next(&mut self, high: f64, low: f64, close: f64) {
-    pub fn next(&mut self, close: f64) {
-        // let value: f64 = (high + low + close) / 3f64;
-        self.typical_price.next(close);
-        self.dev.next(close);
+    pub fn next(&mut self, source: f64) {
+        self.typical_price.next(source);
+        self.dev.next(source);
 
         if let (Some(mean), Some(deviation)) = (self.typical_price.get(), self.dev.get()) {
             let upper_band = mean + self.m * deviation;
@@ -511,6 +522,11 @@ impl BollingerBand {
         self.dev.get().map(|dev| dev * self.m)
     }
 
+    pub fn width(&self) -> Option<f64> {
+        self.value
+            .map(|(basis, upper, lower)| (upper - lower) / basis)
+    }
+
     pub fn get(&self) -> Option<(f64, f64, f64)> {
         self.value
     }
@@ -521,13 +537,8 @@ pub struct TdSeq {
     lows: [f64; 5],
     closes: [f64; 5],
     index: usize,
-    buy_setup_count: u32,
-    sell_setup_count: u32,
+    pub setup_count: i32,
     perfect: bool,
-    pub support: f64,
-    pub resistance: f64,
-    _buy_stop: f64,
-    _sell_stop: f64,
 }
 
 impl TdSeq {
@@ -537,13 +548,8 @@ impl TdSeq {
             lows: [f64::NAN; 5],
             closes: [f64::NAN; 5],
             index: 0,
-            buy_setup_count: 0,
-            sell_setup_count: 0,
+            setup_count: 0,
             perfect: false,
-            support: 0f64,
-            resistance: 0f64,
-            _buy_stop: 0f64,
-            _sell_stop: 0f64,
         }
     }
 
@@ -564,54 +570,36 @@ impl TdSeq {
                 self.index + 1
             };
 
-            if self.buy_setup_count == 9 {
-                self.buy_setup_count = 0;
-            }
-
-            if self.sell_setup_count == 9 {
-                self.sell_setup_count = 0;
-            }
-
-            if self.closes[prev_index] > self.closes[self.index] {
-                if self.sell_setup_count != 0 {
-                    self.sell_setup_count = 0;
-                }
-                if self.buy_setup_count == 0 {
-                    self.resistance = self.highs[self.index];
+            if self.closes[prev_index] < self.closes[self.index] {
+                if self.setup_count.is_positive() || self.setup_count == -9 {
+                    self.setup_count = -1;
                 } else {
-                    self.resistance.max(self.highs[self.index]);
+                    self.setup_count -= 1;
                 }
-                self.buy_setup_count += 1;
             } else {
-                if self.buy_setup_count != 0 {
-                    self.buy_setup_count = 0;
-                }
-                if self.sell_setup_count == 0 {
-                    self.support = self.lows[self.index];
+                if self.setup_count.is_negative() || self.setup_count == 9 {
+                    self.setup_count = 1;
                 } else {
-                    self.support.min(self.lows[self.index]);
+                    self.setup_count += 1;
                 }
-                self.sell_setup_count += 1;
             }
 
-            if self.buy_setup_count == 9 {
-                let sixth = self.lows[(prev_index + 1) % 5];
-                let seventh = self.lows[(prev_index + 2) % 5];
-                let eighth = self.lows[(prev_index + 3) % 5];
-                let ninth = self.lows[self.index];
+            if self.setup_count.abs() == 9 {
+                self.perfect = if self.setup_count.is_positive() {
+                    let sixth = self.lows[(prev_index + 1) % 5];
+                    let seventh = self.lows[(prev_index + 2) % 5];
+                    let eighth = self.lows[(prev_index + 3) % 5];
+                    let ninth = self.lows[self.index];
 
-                self.perfect =
-                    (eighth < sixth && eighth < seventh) || (ninth < sixth && ninth < seventh);
-            }
+                    (eighth < sixth && eighth < seventh) || (ninth < sixth && ninth < seventh)
+                } else {
+                    let sixth = self.highs[(prev_index + 1) % 5];
+                    let seventh = self.highs[(prev_index + 2) % 5];
+                    let eighth = self.highs[(prev_index + 3) % 5];
+                    let ninth = self.highs[self.index];
 
-            if self.sell_setup_count == 9 {
-                let sixth = self.highs[(prev_index + 1) % 5];
-                let seventh = self.highs[(prev_index + 2) % 5];
-                let eighth = self.highs[(prev_index + 3) % 5];
-                let ninth = self.highs[self.index];
-
-                self.perfect =
-                    (eighth > sixth && eighth > seventh) || (ninth > sixth && ninth > seventh);
+                    (eighth > sixth && eighth > seventh) || (ninth > sixth && ninth > seventh)
+                };
             }
 
             if self.index == 4 {
@@ -623,11 +611,11 @@ impl TdSeq {
     }
 
     pub fn buy_perfect(&self) -> bool {
-        self.perfect && self.buy_setup_count == 9
+        self.perfect && self.setup_count == 9
     }
 
     pub fn sell_perfect(&self) -> bool {
-        self.perfect && self.sell_setup_count == 9
+        self.perfect && self.setup_count == -9
     }
 }
 
@@ -637,7 +625,7 @@ mod tests {
 
     #[test]
     fn sma_test() {
-        let mut sma = Sma::new(3);
+        let mut sma = Sma::<3>::new();
 
         assert_eq!(None, sma.get());
         sma.next(1f64);
@@ -652,7 +640,7 @@ mod tests {
 
     #[test]
     fn std_dev_test() {
-        let mut std = StandardDeviation::new(8);
+        let mut std = StandardDeviation::<8>::new();
 
         assert_eq!(None, std.get());
         std.next(2f64);
