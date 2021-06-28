@@ -4,8 +4,8 @@ use trading_rs::exchange::Interval;
 use trading_rs::trading::Trader;
 
 fn main() {
-    let _start_time = Utc.ymd(2021, 4, 29).and_hms(9, 0, 0);
-    let _end_time = Utc.ymd(2021, 5, 4).and_hms(9, 0, 0);
+    let _start_time = Utc.ymd(2021, 1, 15).and_hms(0, 0, 0);
+    let _end_time = Utc.ymd(2021, 5, 6).and_hms(0, 0, 0);
 
     let binance = Account::new();
 
@@ -16,7 +16,7 @@ fn main() {
     let mut backtester = Backtester::new(
         start_time,
         end_time,
-        Symbol::new("DOGE", "USDT"),
+        Symbol::new("BNB", "USDT"),
         Interval::Hour(1),
     );
     backtester.run(binance);

@@ -53,9 +53,11 @@ impl Trader {
 
         println!("\n[INFO] Interval: {}", interval);
 
+        let telegram = telegram::Bot::new();
+        telegram.send_message("[INFO] Bot is online!");
         Self {
             binance,
-            telegram: telegram::Bot::new(),
+            telegram,
             start_time,
             symbols,
             assets,
@@ -101,6 +103,7 @@ impl Trader {
             );
             match rx.recv_timeout(timeout) {
                 Ok(_) => {
+                    self.telegram.send_message("[INFO] Bot is offline!");
                     println!("Exiting");
                     handle.join().unwrap();
                     break;
@@ -132,7 +135,7 @@ impl Trader {
                                 Signal::Buy(_) => {
                                     let msg = format!(
                                         "[{}] {} Buy Signal",
-                                        FixedOffset::east(3)
+                                        FixedOffset::east(3 * 3600)
                                             .timestamp_millis(symbol.kline.open_time),
                                         symbol.as_str()
                                     );
@@ -141,7 +144,7 @@ impl Trader {
                                 Signal::Sell => {
                                     let msg = format!(
                                         "[{}] {} Sell Signal",
-                                        FixedOffset::east(3)
+                                        FixedOffset::east(3 * 3600)
                                             .timestamp_millis(symbol.kline.open_time),
                                         symbol.as_str()
                                     );
@@ -210,7 +213,15 @@ impl Trader {
 
         let quote = quote.unwrap();
         let base = base.unwrap();
-        let quote_order_quantity = quote.balance / (close_position_count as f64);
+        let mut quote_order_quantity = 0f64;
+
+        for i in (1..=close_position_count).rev() {
+            quote_order_quantity = quote.balance / (i as f64);
+            quote_order_quantity = (quote_order_quantity * 1e8f64).trunc() / 1e8f64;
+            if quote_order_quantity > 10f64 {
+                break;
+            }
+        }
 
         if quote_order_quantity > 10f64 {
             self.binance
@@ -262,7 +273,7 @@ impl Trader {
         let quote = quote.unwrap();
         let base = base.unwrap();
 
-        base.balance -= base.balance % 10f64.powi(-symbol.step_size);
+        base.balance = (base.balance * 10f64.powi(symbol.step_size)).trunc() / 10f64.powi(symbol.step_size);
 
         self.binance
             .market_sell(symbol.as_str(), base.balance)
@@ -604,7 +615,7 @@ impl Indicators {
                 self.was_perfect = true;
             }
 
-            if self.was_perfect && adx < 25f64 {
+            if self.was_perfect && kline.close < self.bb.get().unwrap().0 {
                 self.was_perfect = false;
             }
         }
